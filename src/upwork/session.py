@@ -56,7 +56,9 @@ class UpworkSession:
         # Upwork visitor tokens last about one hour; renew ten minutes early.
         self.refresh_after_seconds = refresh_after_seconds or int(os.getenv("UPWORK_SESSION_REFRESH_SECONDS", "3000"))
         self.token_wait_seconds = int(os.getenv("UPWORK_TOKEN_WAIT_SECONDS", "30"))
-        self.retry_delay_seconds = int(os.getenv("UPWORK_REFRESH_RETRY_SECONDS", "300"))
+        # After a failed token refresh, retry every 30 seconds so the scraper
+        # recovers quickly instead of waiting minutes between attempts.
+        self.retry_delay_seconds = int(os.getenv("UPWORK_REFRESH_RETRY_SECONDS", "30"))
         self._clock = clock
         self.cookies: dict[str, str] = {}
         self.user_agent: str | None = None
@@ -66,12 +68,16 @@ class UpworkSession:
     def needs_refresh(self) -> bool:
         return not self.cookies or self.last_refresh is None or self._clock() - self.last_refresh >= self.refresh_after_seconds
 
+# main function that refreshes the session by opening a browser and collecting cookies and user agent
+
     def refresh(self) -> None:
         """Open Chrome once, then collect fresh cookies and the user agent."""
         try:
             import undetected_chromedriver as uc
         except ImportError as exc:
             raise RuntimeError("Install dependencies with `pip install -r requirements.txt` to enable browser-session refresh.") from exc
+
+    #   helps prevent opening chrome after rapid refresh attempts when Upwork rejects the visitor token
 
         if self._retry_after and self._clock() < self._retry_after:
             remaining = int(self._retry_after - self._clock())
@@ -91,23 +97,56 @@ class UpworkSession:
         if chrome_major_version:
             print(f"[upwork] Using ChromeDriver compatible with Chrome {chrome_major_version}.")
             driver_options["version_main"] = chrome_major_version
-        driver = uc.Chrome(**driver_options)
         try:
+            driver = uc.Chrome(**driver_options)
+        except KeyboardInterrupt:
+            # Ctrl+C during driver download/launch: undetected-chromedriver
+            # swallows the interrupt internally, so kill leftover processes
+            # and let the interrupt propagate.
+            subprocess.run(["taskkill", "/F", "/IM", "chromedriver.exe", "/T"],
+                           capture_output=True)
+            raise
+        try:
+            driver.set_page_load_timeout(self.token_wait_seconds)
+            print("[upwork] Opening Upwork in Chrome...")
             driver.get(SEARCH_URL)
             deadline = self._clock() + self.token_wait_seconds
             while self._clock() < deadline:
+
+
+#   refreshed cookies
                 cookies = {item["name"]: item["value"] for item in driver.get_cookies()}
                 if any(cookies.get(name) for name in SEARCH_TOKEN_COOKIES):
                     self.cookies = cookies
                     self.user_agent = driver.execute_script("return navigator.userAgent;")
                     break
                 time.sleep(1)
+        except KeyboardInterrupt:
+            # Ctrl+C while Chrome is navigating/polling: quit the browser so
+            # nothing is left blocking, then let the interrupt propagate.
+            try:
+                driver.quit()
+            except Exception:
+                subprocess.run(["taskkill", "/F", "/IM", "chromedriver.exe", "/T"],
+                               capture_output=True)
+            raise
         finally:
-            driver.quit()
+            try:
+                driver.quit()
+            except OSError as exc:
+                if getattr(exc, "winerror", None) != 6:
+                    raise
+            finally:
+                # undetected-chromedriver may call quit again from __del__.
+                driver.quit = lambda: None
+                driver = None
 
         if not self._visitor_token():
             self.cookies = {}
             self.user_agent = None
+
+#    pause the refresh attempts for a while when Upwork rejects the visitor token
+
             self._retry_after = self._clock() + self.retry_delay_seconds
             raise RuntimeError(
                 "Upwork did not provide a visitor GraphQL token. "
@@ -132,7 +171,11 @@ class UpworkSession:
         cookies, user_agent = self.get_session(force_refresh=force_refresh)
         token = self._visitor_token()
         if not token:
-            raise RuntimeError("Upwork session is missing its visitor GraphQL token.")
+            if force_refresh:
+                raise RuntimeError("Upwork session is missing its visitor GraphQL token.")
+            # The stored session has no usable token: refresh right away
+            # instead of waiting out the normal ~50-minute session lifetime.
+            return self.get_headers(force_refresh=True)
         return {
             "Accept": "*/*", "Content-Type": "application/json", "Origin": "https://www.upwork.com",
             "Referer": SEARCH_URL, "User-Agent": user_agent, "Authorization": f"Bearer {token}",
