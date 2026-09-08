@@ -1,5 +1,6 @@
 import sqlite3
 import os
+from datetime import datetime, timezone
 
 DB_PATH = os.path.join("data", "jobs.db")
 
@@ -72,6 +73,24 @@ def init_db():
         "is_private": "INTEGER DEFAULT 0",
         "delivery_status": "TEXT DEFAULT 'pending'",
         "discord_channel_id": "INTEGER",
+        "full_description": "TEXT",
+        "project_duration": "TEXT",
+        "category_name": "TEXT",
+        "skills": "TEXT",
+        "workload": "TEXT",
+        "client_member_since": "TEXT",
+        "client_jobs_posted": "INTEGER",
+        "client_jobs_open": "INTEGER",
+        "client_total_assignments": "INTEGER",
+        "client_hours_count": "INTEGER",
+        "client_feedback_count": "INTEGER",
+        "client_score": "REAL",
+        "client_country_timezone": "TEXT",
+        "total_hired": "INTEGER",
+        "interviewing": "INTEGER",
+        "invites_sent": "INTEGER",
+        "unanswered_invites": "INTEGER",
+        "job_type_label": "TEXT",
     }.items():
         if column not in columns:
             conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {definition}")
@@ -97,6 +116,7 @@ def job_exists(job_id):
 
 def save_job(job_id, title, ciphertext, job_type, budget_text, level, job_url, source_query=None, details=None):
     """Insert a newly-found job. Does nothing if it already exists (avoids duplicate errors)."""
+    source_query = resolve_canonical_source_query(source_query) if source_query else source_query
     conn = get_connection()
     details = details or {}
     is_private = bool(details.get("is_private")) or not bool(ciphertext)
@@ -126,29 +146,51 @@ def save_job(job_id, title, ciphertext, job_type, budget_text, level, job_url, s
             job_id, title, ciphertext, job_type, budget_text, level, job_url, source_query,
             posted_at, detected_time, proposal_count, payment_verified,
             client_location, client_total_spent, description_preview,
-            is_private, delivery_status, posted_to_discord
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            is_private, delivery_status, posted_to_discord,
+            full_description, project_duration, category_name,
+            skills, workload, client_member_since,
+            client_jobs_posted, client_jobs_open, client_total_assignments,
+            client_hours_count, client_feedback_count, client_score,
+            client_country_timezone, total_hired, interviewing,
+            invites_sent, unanswered_invites, job_type_label
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         job_id, title, ciphertext, job_type, budget_text, level, job_url, source_query,
         details.get("posted_at"), details.get("detected_time"), details.get("proposal_count"),
         details.get("payment_verified"), details.get("client_location"),
         details.get("client_total_spent"), details.get("description_preview"),
         int(is_private), "pending", 0,
+        details.get("full_description"), details.get("project_duration"), details.get("category_name"),
+        ",".join(details.get("skills") or []),
+        details.get("workload"), details.get("client_member_since"),
+        details.get("client_jobs_posted"), details.get("client_jobs_open"),
+        details.get("client_total_assignments"), details.get("client_hours_count"),
+        details.get("client_feedback_count"), details.get("client_score"),
+        details.get("client_country_timezone"),
+        details.get("total_hired"), details.get("interviewing"),
+        details.get("invites_sent"), details.get("unanswered_invites"),
+        details.get("job_type_label"),
     ))
     conn.commit()
     conn.close()
 
 
 def get_unposted_jobs():
-    """Return all jobs that haven't been posted to Discord yet."""
+    """Return all jobs that haven't been posted to Discord yet, oldest first."""
     conn = get_connection()
     cursor = conn.execute("""
         SELECT job_id, title, ciphertext, job_type, budget_text, level, job_url, source_query,
                posted_at, detected_time, proposal_count, payment_verified,
              client_location, client_total_spent, description_preview,
-             is_private, delivery_status, discord_channel_id
+             is_private, delivery_status, discord_channel_id,
+             full_description, project_duration, category_name,
+             skills, workload, client_member_since,
+             client_jobs_posted, client_jobs_open, client_total_assignments,
+             client_hours_count, client_feedback_count, client_score,
+             client_country_timezone, total_hired, interviewing,
+             invites_sent, unanswered_invites, job_type_label
          FROM jobs WHERE posted_to_discord = 0
-        ORDER BY first_seen ASC
+        ORDER BY posted_at ASC, first_seen ASC
     """)
     rows = cursor.fetchall()
     conn.close()
@@ -158,8 +200,82 @@ def get_unposted_jobs():
         "posted_at", "detected_time", "proposal_count", "payment_verified",
         "client_location", "client_total_spent", "description_preview",
         "is_private", "delivery_status", "discord_channel_id",
-    ]
-    return [dict(zip(columns, row)) for row in rows]
+        "full_description", "project_duration", "category_name",
+        "skills", "workload", "client_member_since",
+        "client_jobs_posted", "client_jobs_open", "client_total_assignments",
+            "client_hours_count", "client_feedback_count", "client_score",
+            "client_country_timezone", "total_hired", "interviewing",
+            "invites_sent", "unanswered_invites", "job_type_label",
+        ]
+    jobs = [dict(zip(columns, row)) for row in rows]
+    cutoff = datetime.now(timezone.utc).timestamp() - (30 * 86400)
+    filtered = []
+    for job in jobs:
+        posted_at = job.get("posted_at")
+        posted_ts = None
+        if posted_at is not None:
+            try:
+                if isinstance(posted_at, (int, float)):
+                    posted_ts = float(posted_at)
+                else:
+                    text = str(posted_at)
+                    if text.replace(".", "", 1).isdigit():
+                        posted_ts = float(text)
+                    else:
+                        posted_ts = datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+            except (TypeError, ValueError, OSError):
+                posted_ts = None
+        if posted_ts is not None and posted_ts < cutoff:
+            continue
+        filtered.append(job)
+    return filtered
+
+
+def update_job_details(job_id, details):
+    """Backfill fields on a job row (used to enrich jobs saved before the
+    full_description column existed)."""
+    if not details:
+        return
+    conn = get_connection()
+    try:
+        assignments = []
+        values = []
+        for key in (
+            "full_description", "project_duration", "category_name",
+            "description_preview", "client_location", "client_total_spent",
+            "proposal_count", "payment_verified", "client_jobs_posted",
+            "client_jobs_open", "client_total_assignments", "client_hours_count",
+            "client_feedback_count", "client_score", "client_country_timezone",
+            "client_member_since", "workload",
+            "total_hired", "interviewing", "invites_sent",
+            "unanswered_invites", "job_type_label",
+        ):
+            if key in details:
+                assignments.append(f"{key} = ?")
+                values.append(details[key])
+        if details.get("skills"):
+            assignments.append("skills = ?")
+            values.append(",".join(details["skills"]))
+        if not assignments:
+            return
+        values.append(job_id)
+        conn.execute(
+            f"UPDATE jobs SET {', '.join(assignments)} WHERE job_id = ?",
+            values,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_unposted_job_count():
+    """Return the number of unposted jobs (for periodic logging)."""
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM jobs WHERE posted_to_discord = 0").fetchone()
+        return row[0] if row else 0
+    finally:
+        conn.close()
 
 
 def mark_as_posted(job_id):
@@ -174,24 +290,95 @@ def mark_as_posted(job_id):
 
 
 def cleanup_old_jobs(days=30):
-    """Delete jobs older than ``days`` days and return the deleted count."""
+    """Delete jobs older than ``days`` days by scrape date or Upwork post date."""
     if days < 1:
         raise ValueError("days must be at least 1")
+    cutoff = datetime.now(timezone.utc).timestamp() - (days * 86400)
     conn = get_connection()
     try:
         cursor = conn.execute(
             "DELETE FROM jobs WHERE first_seen < datetime('now', ?)",
             (f"-{days} days",),
         )
+        deleted_by_first_seen = cursor.rowcount
+        cursor = conn.execute(
+            "SELECT job_id, posted_at FROM jobs WHERE posted_at IS NOT NULL"
+        )
+        deleted_by_posted_at = 0
+        for job_id, posted_at in cursor.fetchall():
+            posted_ts = None
+            if posted_at:
+                try:
+                    if str(posted_at).replace(".", "", 1).isdigit():
+                        posted_ts = float(posted_at)
+                        if posted_ts > 10_000_000_000:
+                            posted_ts /= 1000
+                    else:
+                        posted_dt = datetime.fromisoformat(str(posted_at).replace("Z", "+00:00"))
+                        posted_ts = posted_dt.timestamp()
+                except (TypeError, ValueError, OSError):
+                    continue
+            if posted_ts is not None and posted_ts < cutoff:
+                conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+                deleted_by_posted_at += 1
         conn.commit()
-        return cursor.rowcount
+        return deleted_by_first_seen + deleted_by_posted_at
+    finally:
+        conn.close()
+
+
+def purge_unpostable_jobs():
+    """One-shot cleanup: remove all unposted jobs older than 30 days by posted_at.
+
+    Used to clear a backlog where rows accumulated before the scrape-time filter
+    was added. Safe to call repeatedly.
+    """
+    cutoff = datetime.now(timezone.utc).timestamp() - (30 * 86400)
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT job_id, posted_at FROM jobs WHERE posted_to_discord = 0 AND posted_at IS NOT NULL"
+        ).fetchall()
+        deleted = 0
+        for job_id, posted_at in rows:
+            posted_ts = None
+            try:
+                if isinstance(posted_at, (int, float)):
+                    posted_ts = float(posted_at)
+                else:
+                    text = str(posted_at)
+                    if text.replace(".", "", 1).isdigit():
+                        posted_ts = float(text)
+                    else:
+                        posted_ts = datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+            except (TypeError, ValueError, OSError):
+                continue
+            if posted_ts is not None and posted_ts < cutoff:
+                conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+                deleted += 1
+        conn.commit()
+        return deleted
     finally:
         conn.close()
 
 
 def save_channel_mapping(source_query, channel_id, channel_name):
+    """Insert or update a channel mapping. If a different source_query is
+    already mapped to the same channel_id, deactivate it and reassign so the
+    dashboard does not show the channel twice with conflicting status."""
     conn = get_connection()
     try:
+        existing = conn.execute(
+            "SELECT source_query, active FROM discord_channels WHERE channel_id = ?",
+            (channel_id,),
+        ).fetchall()
+        for existing_query, existing_active in existing:
+            if existing_query != source_query and existing_active:
+                conn.execute(
+                    "UPDATE discord_channels SET active = 0, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE channel_id = ? AND source_query = ?",
+                    (channel_id, existing_query),
+                )
         conn.execute(
             """INSERT INTO discord_channels (source_query, channel_id, channel_name, updated_at)
                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
@@ -328,3 +515,31 @@ def is_channel_deleted_for_query(source_query):
         return row is not None and row[0] == 0
     finally:
         conn.close()
+
+
+def resolve_canonical_source_query(query):
+    """If a different but related query has an active channel mapping, return
+    that query instead. Otherwise return the input unchanged.
+
+    Example: "mern stack developer" → "mern stack" (if the channel is mapped
+    to "mern stack"). This keeps jobs and the routing table in sync.
+    """
+    if not query:
+        return query
+    target = query.casefold().strip()
+    target_words = set(target.replace(".", " ").split())
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT source_query FROM discord_channels WHERE active = 1"
+        ).fetchall()
+    finally:
+        conn.close()
+    for (mapped_query,) in rows:
+        mapped = (mapped_query or "").casefold().strip()
+        if not mapped or mapped == target:
+            continue
+        mapped_words = set(mapped.replace(".", " ").split())
+        if target_words == mapped_words or target_words < mapped_words or mapped_words < target_words:
+            return mapped_query
+    return query

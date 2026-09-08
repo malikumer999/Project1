@@ -1,6 +1,7 @@
 """Upwork GraphQL requests with proactive and rejection-triggered refresh."""
 
 import logging
+import time
 
 import requests
 import urllib3
@@ -18,12 +19,14 @@ class NetworkUnavailableError(RuntimeError):
 
 
 def _post_graphql(alias, payload):
-    """Send a request; renew once if the current visitor token is rejected."""
-    for attempt in range(2):
+    """Send a request; renew the browser session only when Upwork rejects the
+    visitor token (401/403). Rate limits (429) are waited out without ever
+    opening Chrome, so the browser only launches when the session truly expired."""
+    for attempt in range(3):
         try:
-            headers, cookies = session_manager.get_headers(force_refresh=attempt == 1)
+            headers, cookies = session_manager.get_headers(force_refresh=attempt >= 1)
             response = requests.post(
-                GRAPHQL_URL, 
+                GRAPHQL_URL,
                 params={"alias": alias},
                 headers=headers,
                 cookies=cookies,
@@ -33,6 +36,14 @@ def _post_graphql(alias, payload):
             raise NetworkUnavailableError(
                 "Network is unavailable or unstable; retrying later."
             ) from exc
+        if response.status_code == 429:
+            # Rate limited: the session is fine. Wait and retry with the SAME
+            # session instead of launching a browser refresh.
+            retry_after = response.headers.get("Retry-After")
+            wait = int(retry_after) if retry_after and retry_after.isdigit() else 15
+            logger.warning("Upwork rate limit hit (429); waiting %ds before retrying.", wait)
+            time.sleep(min(wait, 60))
+            continue
         if response.status_code not in (401, 403):
             try:
                 response.raise_for_status()
@@ -48,7 +59,7 @@ def _post_graphql(alias, payload):
 def search_jobs(query, offset=0, count=10):
     return _post_graphql("visitorJobSearch", {
         "query": SEARCH_QUERY,
-        "variables": {"requestVariables": {"userQuery": query, "sort": "relevance+desc", "highlight": True, "paging": {"offset": offset, "count": count}}},
+        "variables": {"requestVariables": {"userQuery": query, "sort": "recency+desc", "highlight": True, "paging": {"offset": offset, "count": count}}},
     })
 
 

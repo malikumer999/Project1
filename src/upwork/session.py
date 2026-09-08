@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -10,6 +11,7 @@ from typing import Callable
 
 SEARCH_URL = "https://www.upwork.com/nx/search/jobs/?q=python%20developer"
 SEARCH_TOKEN_COOKIES = ("UniversalSearchNuxt_vt", "visitor_gql_token", "visitor_signup_gql_token")
+SESSION_FILE = os.path.join("data", "upwork_session.json")
 
 
 def _installed_chrome_major_version(uc) -> int | None:
@@ -59,11 +61,48 @@ class UpworkSession:
         # After a failed token refresh, retry every 30 seconds so the scraper
         # recovers quickly instead of waiting minutes between attempts.
         self.retry_delay_seconds = int(os.getenv("UPWORK_REFRESH_RETRY_SECONDS", "30"))
+        # Minimum time between actual Chrome launches. A forced refresh requested
+        # sooner than this reuses the existing session instead of opening a new
+        # browser window — this is what stops Chrome from popping up every few
+        # minutes when Upwork rejects requests repeatedly.
+        self.min_refresh_interval = int(os.getenv("UPWORK_MIN_REFRESH_SECONDS", "800"))
         self._clock = clock
         self.cookies: dict[str, str] = {}
         self.user_agent: str | None = None
         self.last_refresh: float | None = None
         self._retry_after: float | None = None
+        self._load_session()
+
+    def _load_session(self) -> None:
+        """Restore a session persisted by this or another process (bot/scraper
+        share one session file) so Chrome does not open again on startup."""
+        try:
+            with open(SESSION_FILE, "r", encoding="utf-8") as file:
+                data = json.load(file)
+            cookies = data.get("cookies") or {}
+            user_agent = data.get("user_agent")
+            last_refresh = data.get("last_refresh")
+            if cookies and user_agent:
+                self.cookies = cookies
+                self.user_agent = user_agent
+                self.last_refresh = float(last_refresh) if last_refresh is not None else None
+        except (OSError, ValueError, TypeError):
+            pass
+
+    def _save_session(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(SESSION_FILE), exist_ok=True)
+            with open(SESSION_FILE, "w", encoding="utf-8") as file:
+                json.dump(
+                    {
+                        "cookies": self.cookies,
+                        "user_agent": self.user_agent,
+                        "last_refresh": self.last_refresh,
+                    },
+                    file,
+                )
+        except OSError:
+            pass
 
     def needs_refresh(self) -> bool:
         return not self.cookies or self.last_refresh is None or self._clock() - self.last_refresh >= self.refresh_after_seconds
@@ -154,14 +193,31 @@ class UpworkSession:
             )
         self.last_refresh = self._clock()
         self._retry_after = None
+        self._save_session()
         print("[upwork] Session refreshed.")
 
     def _visitor_token(self) -> str | None:
         return next((self.cookies[name] for name in SEARCH_TOKEN_COOKIES if self.cookies.get(name)), None)
 
     def get_session(self, force_refresh: bool = False) -> tuple[dict[str, str], str]:
+        if force_refresh and self.last_refresh is not None:
+            # A browser was opened very recently; the fresh cookies may not have
+            # propagated yet. Reuse them instead of opening Chrome again —
+            # this is the anti-thrash guard that keeps the window from
+            # re-appearing every few minutes on repeated rejections.
+            since = self._clock() - self.last_refresh
+            if since < self.min_refresh_interval and self._visitor_token():
+                return self.cookies.copy(), self.user_agent
         if force_refresh or self.needs_refresh():
-            self.refresh()
+            try:
+                self.refresh()
+            except RuntimeError as exc:
+                # If a browser was opened recently, keep serving the existing
+                # session rather than crashing the request pipeline.
+                if self.cookies and self.user_agent and self._visitor_token():
+                    print(f"[upwork] Keeping existing session ({exc})")
+                else:
+                    raise
         if not self.user_agent:
             raise RuntimeError("Upwork session is missing a user agent.")
         return self.cookies.copy(), self.user_agent

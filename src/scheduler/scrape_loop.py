@@ -24,13 +24,16 @@ DEFAULT_SEARCH_QUERIES = (
     "python developer",
 )
 PAGE_SIZE = 10
-MAX_PAGES_PER_QUERY = int(os.getenv("UPWORK_MAX_PAGES_PER_QUERY", "3"))
+MAX_PAGES_PER_QUERY = int(os.getenv("UPWORK_MAX_PAGES_PER_QUERY", "5"))
+# Jobs older than this are never saved or posted (default: 30 days).
+MAX_JOB_AGE_SECONDS = int(os.getenv("UPWORK_MAX_JOB_AGE_DAYS", "30")) * 86_400
 CLEANUP_INTERVAL_SECONDS = int(os.getenv("UPWORK_CLEANUP_INTERVAL_SECONDS", "3600"))
 logger = logging.getLogger("scraper")
 
 
 def get_search_queries():
     """Read comma-separated search phrases, or use the project's defaults."""
+    load_dotenv(override=False)
     configured = os.getenv("UPWORK_SEARCH_QUERIES")
     file_configured = dotenv_values().get("UPWORK_SEARCH_QUERIES")
     if configured == _initial_search_queries and file_configured is not None:
@@ -38,16 +41,47 @@ def get_search_queries():
     if not configured:
         return DEFAULT_SEARCH_QUERIES
     queries = tuple(query.strip() for query in configured.split(",") if query.strip())
-    # Drop queries whose words are fully contained in a longer query (e.g.
-    # "mern stack" inside "mern stack developer") so one channel is scraped once.
+    # When one query is a word-superset of another (e.g. "mern stack" and
+    # "mern stack developer"), keep only ONE so we don't scrape the same jobs
+    # twice. Prefer the one that has an active channel mapping; if neither does,
+    # keep the longer (more specific) one.
     word_sets = [set(q.casefold().replace(".", " ").split()) for q in queries]
-    queries = tuple(
-        q for i, q in enumerate(queries)
-        if not any(
-            i != j and word_sets[i] < word_sets[j]
-            for j in range(len(queries))
-        )
-    )
+    channel_by_query = {
+        (source_query or "").casefold(): True
+        for source_query, _cid, _name, active in get_channel_mappings()
+        if active
+    }
+    drop = set()
+    for i in range(len(queries)):
+        if i in drop:
+            continue
+        for j in range(len(queries)):
+            if i == j or j in drop:
+                continue
+            if word_sets[i] < word_sets[j] or word_sets[j] < word_sets[i]:
+                i_mapped = channel_by_query.get(queries[i].casefold())
+                j_mapped = channel_by_query.get(queries[j].casefold())
+                if i_mapped and not j_mapped:
+                    drop.add(j)
+                elif j_mapped and not i_mapped:
+                    drop.add(i)
+                    break
+                elif word_sets[i] < word_sets[j]:
+                    drop.add(i)
+                    break
+                else:
+                    drop.add(j)
+    queries = tuple(q for i, q in enumerate(queries) if i not in drop)
+    # Dedupe by casefold so trailing duplicates collapse.
+    seen = set()
+    unique = []
+    for q in queries:
+        key = q.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(q)
+    queries = tuple(unique)
     # Two different queries can still point at the same Discord channel (e.g.
     # "full stack developer" and "fullstackjobs"); scrape each channel once.
     seen_channel_ids = set()
@@ -76,6 +110,7 @@ def clean_highlight_markers(text):
 
 def job_matches_query(job, query):
     """Require every meaningful query word to appear in the search result."""
+    #used to filter out irrelevant jobs that Upwork returns for a query, e.g. "python developer" returning "python developer and seo expert"
     query_words = {
         word for word in query.casefold().replace(".", " ").split() if word
     }
@@ -115,26 +150,59 @@ def extract_paging_from_response(results):
     )
 
 
+def _format_money(value):
+    """Render a numeric value as a clean dollar amount (no trailing .0 noise)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value) if value is not None else "Not specified"
+    if number.is_integer():
+        return f"${int(number):,}"
+    return f"${number:,.2f}"
+
+
 def format_budget(job_data):
     job_type = job_data.get("jobType", "")
     if job_type == "HOURLY":
         rate_min = job_data.get("hourlyBudgetMin")
         rate_max = job_data.get("hourlyBudgetMax")
         if rate_min and rate_max:
-            return f"${rate_min}-${rate_max}/hr"
+            return f"{_format_money(rate_min)}-{_format_money(rate_max)}/hr"
         elif rate_min:
-            return f"${rate_min}+/hr"
+            return f"{_format_money(rate_min)}+/hr"
         else:
             return "Rate not specified by client"
     else:
         amount = job_data.get("fixedPriceAmount") or {}
-        return f"${amount.get('amount')}" if amount.get("amount") else "Budget not specified"
+        return _format_money(amount.get("amount")) if amount.get("amount") else "Budget not specified"
 
 
 def description_preview(description, limit=280):
     """Flatten the full description into a Discord-friendly short preview."""
     text = " ".join((description or "").split())
     return f"{text[:limit].rstrip()}..." if len(text) > limit else text
+
+
+def _normalize_posted_at(value):
+    """Convert Upwork posted_at to a Unix timestamp in seconds (float)."""
+    if not value:
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            timestamp = float(value)
+            if timestamp > 10_000_000_000:
+                timestamp /= 1000
+            return timestamp
+        text = str(value)
+        if text.replace(".", "", 1).isdigit():
+            timestamp = float(text)
+            if timestamp > 10_000_000_000:
+                timestamp /= 1000
+            return timestamp
+        posted = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return posted.timestamp()
+    except (TypeError, ValueError, OSError):
+        return None
 
 
 def extract_detail_fields(response):
@@ -148,18 +216,107 @@ def extract_detail_fields(response):
     location = buyer.get("location") or {}
     stats = buyer.get("stats") or {}
     total_charges = stats.get("totalCharges") or {}
+    buyer_jobs = buyer.get("jobs") or {}
+    company = buyer.get("company") or {}
     client_location = ", ".join(filter(None, (location.get("city"), location.get("country"))))
+    full_description = clean_highlight_markers(opening.get("description") or "")
+    engagement = opening.get("engagementDuration") or {}
+    category = opening.get("category") or {}
+    budget = opening.get("budget") or {}
+    segmentation = opening.get("segmentationData") or []
+    skills = []
+    seen_skills = set()
+    for item in segmentation:
+        if not isinstance(item, dict):
+            continue
+        label = item.get("label") or item.get("name")
+        if not label or label in seen_skills:
+            continue
+        if item.get("type") in ("skill", "SKILL"):
+            skills.append(label)
+            seen_skills.add(label)
+    sands_skills = (opening.get("sandsData") or {}).get("ontologySkills") or []
+    for item in sands_skills:
+        if not isinstance(item, dict):
+            continue
+        label = item.get("prefLabel")
+        if label and label not in seen_skills:
+            skills.append(label)
+            seen_skills.add(label)
+    client_activity = opening.get("clientActivity") or {}
+    workload = opening.get("workload") or ""
+    extended_budget = opening.get("extendedBudgetInfo") or {}
 
     return {
-        "posted_at": opening.get("postedOn") or opening.get("publishTime"),
+        "posted_at": _normalize_posted_at(opening.get("postedOn") or opening.get("publishTime")),
         "detected_time": datetime.now().strftime("%H:%M"),
-        "proposal_count": (opening.get("clientActivity") or {}).get("totalApplicants"),
+        "proposal_count": client_activity.get("totalApplicants"),
+        "total_hired": client_activity.get("totalHired"),
+        "interviewing": client_activity.get("unansweredInvites"),
+        "invites_sent": client_activity.get("invitationsSent"),
         "payment_verified": buyer_extra.get("isPaymentMethodVerified"),
         "client_location": client_location or "Location not specified",
         "client_total_spent": total_charges.get("amount"),
+        "client_total_assignments": stats.get("totalAssignments"),
+        "client_hours_count": stats.get("hoursCount"),
+        "client_feedback_count": stats.get("feedbackCount"),
+        "client_score": stats.get("score"),
+        "client_jobs_posted": buyer_jobs.get("postedCount"),
+        "client_jobs_open": buyer_jobs.get("openCount"),
+        "client_member_since": _normalize_posted_at(company.get("contractDate")),
+        "client_country_timezone": location.get("countryTimezone"),
+        "client_company_name": company.get("name"),
         "description_preview": description_preview(opening.get("description")),
+        "full_description": full_description,
+        "project_duration": engagement.get("label"),
+        "experience_level": (opening.get("info") or {}).get("contractorTier"),
+        "job_type_label": (opening.get("info") or {}).get("type") or budget.get("currencyCode"),
+        "workload": workload,
+        "contract_to_hire": bool(opening.get("contractToHire")),
+        "category_name": category.get("name"),
+        "skills": skills,
         "is_private": unavailable,
     }
+
+
+def _search_posted_too_old(job, max_age_seconds=MAX_JOB_AGE_SECONDS):
+    """Return True when the search result's own timestamp is older than max_age."""
+    job_data = job.get("jobTile", {}).get("job", {}) or {}
+    for key in ("publishTime", "createTime", "sourcingTimestamp"):
+        value = job_data.get(key)
+        if value is None:
+            continue
+        try:
+            ts = float(value)
+            if ts > 10_000_000_000:
+                ts /= 1000
+            from time import time as _now
+            if (_now() - ts) > max_age_seconds:
+                return True
+            return False
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _is_posted_too_old(details, max_age_seconds=MAX_JOB_AGE_SECONDS):
+    """Return True when the parsed posted_at is older than max_age_seconds."""
+    posted_at = (details or {}).get("posted_at")
+    if posted_at is None:
+        return False
+    try:
+        if isinstance(posted_at, (int, float)):
+            ts = float(posted_at)
+        else:
+            text = str(posted_at)
+            if text.replace(".", "", 1).isdigit():
+                ts = float(text)
+            else:
+                ts = datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        from time import time as _now
+        return (_now() - ts) > max_age_seconds
+    except (TypeError, ValueError, OSError):
+        return False
 
 
 def run_scrape_cycle(query="python developer", max_pages=MAX_PAGES_PER_QUERY):
@@ -189,11 +346,38 @@ def run_scrape_cycle(query="python developer", max_pages=MAX_PAGES_PER_QUERY):
             if not job_id:
                 continue
 
-            ciphertext = job_data.get("ciphertext", "")
-            if ciphertext and not job_matches_query(job, query):
+            if job_exists(job_id):
+                logger.debug("DEDUP: job %s already exists in DB, skipping", job_id)
                 continue
 
-            if job_exists(job_id):
+            search_ts = None
+            job_data_raw = job.get("jobTile", {}).get("job", {}) or {}
+            for key in ("publishTime", "createTime", "sourcingTimestamp"):
+                val = job_data_raw.get(key)
+                if val is not None:
+                    try:
+                        search_ts = float(val)
+                        if search_ts > 10_000_000_000:
+                            search_ts /= 1000
+                    except (TypeError, ValueError):
+                        pass
+                    break
+            search_age_days = ((time.time() if hasattr(time, 'time') else __import__('time').time()) - search_ts) / 86400 if search_ts else None
+            too_old_search = _search_posted_too_old(job)
+            if too_old_search:
+                age_str = f"{search_age_days:.1f} days" if search_age_days is not None else "unknown"
+                logger.debug(
+                    "AGE FILTER (search): skipping job %s — search timestamp=%.3f, age=%s, limit=30 days",
+                    job_id, search_ts or -1, age_str,
+                )
+                continue
+
+            ciphertext = job_data.get("ciphertext", "")
+            if ciphertext and not job_matches_query(job, query):
+                logger.debug(
+                    "QUERY MISMATCH: job %s does not match query '%s' (title=%r)",
+                    job_id, query, job.get("title", "")[:60],
+                )
                 continue
 
             title = clean_highlight_markers(job.get("title", "Untitled job"))
@@ -207,6 +391,7 @@ def run_scrape_cycle(query="python developer", max_pages=MAX_PAGES_PER_QUERY):
             level = job_data.get("contractorTier", "Not specified")
             job_url = f"https://www.upwork.com/jobs/{ciphertext}" if ciphertext else ""
             details = {
+                "posted_at": None,
                 "detected_time": datetime.now().strftime("%H:%M"),
                 "is_private": not bool(ciphertext),
             }
@@ -214,9 +399,42 @@ def run_scrape_cycle(query="python developer", max_pages=MAX_PAGES_PER_QUERY):
             if ciphertext:
                 try:
                     details = extract_detail_fields(get_job_details(ciphertext))
+                    if details.get("is_private"):
+                        # Transient failures (network, Selenium hiccup) look
+                        # identical to a genuinely private job. Retry once
+                        # before accepting the private/unavailable verdict.
+                        time.sleep(2)
+                        details = extract_detail_fields(get_job_details(ciphertext))
                 except Exception as exc:
-                    # A details failure should not discard a newly found job.
                     logger.warning("Could not enrich job %s: %s", job_id, exc)
+
+            # A job with a ciphertext has a public page: never route it to the
+            # private/unavailable channel just because detail enrichment failed.
+            # The bot backfills missing details before posting.
+            if ciphertext and details.get("is_private"):
+                details["is_private"] = 0
+
+            if _is_posted_too_old(details):
+                posted_at = details.get("posted_at")
+                age_days = None
+                try:
+                    if isinstance(posted_at, (int, float)):
+                        ts = float(posted_at)
+                    else:
+                        text = str(posted_at)
+                        if text.replace(".", "", 1).isdigit():
+                            ts = float(text)
+                        else:
+                            ts = datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+                    age_days = (time.time() - ts) / 86400
+                except Exception:
+                    pass
+                age_str = f"{age_days:.1f} days" if age_days is not None else "unknown"
+                logger.debug(
+                    "AGE FILTER (details): skipping job %s — posted_at=%s, age=%s, limit=30 days",
+                    job_id, posted_at, age_str,
+                )
+                continue
 
             try:
                 save_job(job_id, title, ciphertext, job_type, budget_text, level, job_url, query, details)
@@ -249,15 +467,20 @@ def run_scrape_loop(install_signal_handlers=True):
         started_at = time.monotonic()
         last_uptime_report = started_at
         logger.info("Starting scrape loop")
+        warned_deleted_queries = set()
         while True:
             network_available = True
             for search_query in get_search_queries():
                 if is_channel_deleted_for_query(search_query):
-                    logger.info(
-                        "Skipping '%s': its Discord channel was deleted",
-                        search_query,
-                    )
+                    if search_query not in warned_deleted_queries:
+                        logger.info(
+                            "Skipping '%s': its Discord channel was deleted",
+                            search_query,
+                        )
+                        warned_deleted_queries.add(search_query)
                     continue
+                if search_query in warned_deleted_queries:
+                    warned_deleted_queries.discard(search_query)
                 if not run_scrape_cycle(search_query):
                     network_available = False
                     break
@@ -285,4 +508,40 @@ def run_scrape_loop(install_signal_handlers=True):
 
 
 if __name__ == "__main__":
+    import os
+    import signal
+    import time
+
+    from src.dashboard import request_shutdown, start_dashboard
+    from src.storage.database import get_connection
+
+    start_dashboard(open_browser=True)
+    print("[scraper] Dashboard opened in your default browser.")
+
+    started_at = time.monotonic()
+
+    def _handle_shutdown(signum, _frame):
+        elapsed = time.monotonic() - started_at
+        h, rem = divmod(int(elapsed), 3600)
+        m, s = divmod(rem, 60)
+        print(f"\n[scraper] Stop signal received (signal {signum}). Uptime: {h:02d}:{m:02d}:{s:02d}")
+        request_shutdown()
+        conn = get_connection()
+        try:
+            total_jobs = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+            posted_jobs = conn.execute("SELECT COUNT(*) FROM jobs WHERE posted_to_discord = 1").fetchone()[0]
+            channel_count = conn.execute("SELECT COUNT(*) FROM discord_channels WHERE active = 1").fetchone()[0]
+        finally:
+            conn.close()
+        print("=" * 60)
+        print("  SCRAPER STOPPED")
+        print("=" * 60)
+        print(f"  Discord Channels (active): {channel_count}")
+        print(f"  Total Jobs:                {total_jobs}")
+        print(f"  Posted to Discord:         {posted_jobs}")
+        print("=" * 60)
+        os._exit(0)
+
+    signal.signal(signal.SIGINT, _handle_shutdown)
+    signal.signal(signal.SIGTERM, _handle_shutdown)
     run_scrape_loop()

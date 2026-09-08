@@ -22,8 +22,12 @@ from src.storage.database import (
     delete_jobs_for_query,
     delete_unposted_jobs_for_query,
     has_channel_mapping_for_query,
+    purge_unpostable_jobs,
+    update_job_details,
 )
 from src.logger import check_memory_usage, format_uptime
+from src.upwork.scraper import get_job_details as fetch_job_details
+from src.scheduler.scrape_loop import extract_detail_fields
 
 
 load_dotenv()
@@ -179,6 +183,7 @@ def persist_search_query(query):
         lines.append(replacement)
     with open(env_path, "w", encoding="utf-8") as file:
         file.writelines(lines)
+    load_dotenv(override=True)
     logger.info("Added new Upwork search query from channel name: '%s'", query)
 
 
@@ -343,7 +348,115 @@ def format_spend(amount):
         number = float(amount)
     except (TypeError, ValueError):
         return str(amount)
-    return f"${number:,.0f}" if number.is_integer() else f"${number:,.2f}"
+    if number.is_integer():
+        return f"${int(number):,}"
+    return f"${number:,.2f}"
+
+
+def _thread_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _thread_member_since(value):
+    """Render client_member_since (unix ts or ISO) as 'Sep 8, 2026'."""
+    if value in (None, ""):
+        return "Not specified"
+    try:
+        ts = float(value)
+        if ts > 10_000_000_000:
+            ts /= 1000
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%b %d, %Y")
+    except (TypeError, ValueError, OSError):
+        return str(value)
+
+
+def _thread_proposals(value):
+    """Map proposal_count to an Upwork-like range label."""
+    count = _thread_int(value)
+    if count <= 0:
+        return "0"
+    if count <= 4:
+        return "Less than 5"
+    if count <= 9:
+        return "5 to 10"
+    if count <= 14:
+        return "10 to 15"
+    if count <= 19:
+        return "15 to 20"
+    return "20+"
+
+
+def format_thread_content(job):
+    """Build the thread message: the full job details, structured like the
+    Upwork job page (summary, budget, type, skills, activity, client info)."""
+    description = job.get("full_description") or job.get("description_preview") or "No description available."
+    title = (job.get("title") or "").strip()
+    if title:
+        for variant in {title, title.replace("—", "-"), title.replace("-", "—")}:
+            variant = variant.strip()
+            if variant and description.lower().startswith(variant.lower()):
+                description = description[len(variant):].lstrip(" \n\r\t-—:.,")
+                break
+
+    lines = []
+    if title:
+        lines.append(f"**{title}**")
+    lines.append(f"Posted {format_time_ago(job.get('posted_at'))}")
+    location = (job.get("client_location") or "").strip()
+    if location and location != "Location not specified":
+        lines.append(location)
+
+    lines.append("")
+    lines.append("**Summary**")
+    lines.append(description)
+
+    lines.append("")
+    lines.append(f"**{job.get('budget_text') or 'Budget not specified'}**")
+    lines.append(job.get("job_type_label") or job.get("job_type") or "Not specified")
+    lines.append("")
+    lines.append(job.get("level") or "Not specified")
+    lines.append("Experience Level")
+    lines.append("Remote Job")
+    if job.get("project_duration"):
+        lines.append(job["project_duration"])
+    lines.append("Project Type")
+
+    skills = [s.strip() for s in (job.get("skills") or "").split(",") if s.strip()]
+    if skills:
+        lines.append("")
+        lines.append("**Skills and Expertise**")
+        lines.append("Mandatory skills")
+        lines.append(", ".join(skills))
+
+    lines.append("")
+    lines.append("**Activity on this job**")
+    lines.append(f"Proposals: {_thread_proposals(job.get('proposal_count'))}")
+    lines.append(f"Hires: {_thread_int(job.get('total_hired'))}")
+    lines.append(f"Interviewing: {_thread_int(job.get('interviewing'))}")
+    lines.append(f"Invites sent: {_thread_int(job.get('invites_sent'))}")
+    lines.append(f"Unanswered invites: {_thread_int(job.get('unanswered_invites'))}")
+
+    lines.append("")
+    lines.append("**About the client**")
+    lines.append(f"Member since {_thread_member_since(job.get('client_member_since'))}")
+    if location:
+        lines.append(location)
+    assignments = _thread_int(job.get("client_total_assignments"))
+    jobs_open = _thread_int(job.get("client_jobs_open"))
+    hires = _thread_int(job.get("total_hired")) or assignments
+    lines.append(f"{hires} hire{'s' if hires != 1 else ''}, {jobs_open} active")
+
+    if job.get("job_url"):
+        lines.append("")
+        lines.append(f"[View job on Upwork]({job['job_url']})")
+
+    content = "\n".join(lines)
+    if len(content) > 1900:
+        content = content[:1897].rstrip() + "..."
+    return content or "No details available."
 
 
 def format_time_ago(value):
@@ -380,14 +493,26 @@ def get_channel_id_for_job(job):
     """Route specialized search results to their configured Discord channels."""
     if job.get("is_private"):
         mapping = get_channel_mapping("private-unavailable")
-        return mapping[0] if mapping else PRIVATE_UNAVAILABLE_CHANNEL_ID
+        if mapping:
+            return mapping[0]
+        if PRIVATE_UNAVAILABLE_CHANNEL_ID:
+            save_channel_mapping("private-unavailable", PRIVATE_UNAVAILABLE_CHANNEL_ID, "private-unavailable-jobs")
+            return PRIVATE_UNAVAILABLE_CHANNEL_ID
+        return None
+
+    if job.get("posted_at") is None:
+        mapping = get_channel_mapping("private-unavailable")
+        if mapping:
+            return mapping[0]
+        if PRIVATE_UNAVAILABLE_CHANNEL_ID:
+            save_channel_mapping("private-unavailable", PRIVATE_UNAVAILABLE_CHANNEL_ID, "private-unavailable-jobs")
+            return PRIVATE_UNAVAILABLE_CHANNEL_ID
+        return None
 
     source_query = job.get("source_query", "").casefold()
     mapping = get_channel_mapping(source_query)
     if mapping:
         return mapping[0]
-    # This query used to have a dedicated channel that has since been deleted.
-    # Keep the job queued instead of dumping it into the generic default channel.
     if has_channel_mapping_for_query(source_query):
         return None
     specialized_channels = {
@@ -395,17 +520,11 @@ def get_channel_id_for_job(job):
         ".net developer": DOTNET_CHANNEL_ID,
         "sqa engineer": SQA_CHANNEL_ID,
         "python developer": PYTHON_CHANNEL_ID,
-        "private-unavailable": PRIVATE_UNAVAILABLE_CHANNEL_ID,
     }
-    if source_query == "private-unavailable" and not (
-        PRIVATE_UNAVAILABLE_CHANNEL_ID or get_channel_mapping(source_query)
-    ):
-        return None
     channel_id = specialized_channels.get(source_query)
     if channel_id:
+        save_channel_mapping(source_query, channel_id, QUERY_CHANNEL_NAMES.get(source_query, source_query))
         return channel_id
-    # Channels created manually after startup: their IDs live only in .env
-    # (e.g. DISCORD_CHANNEL_LARAVEL_DEVELOPER_ID) until the next restart.
     env_values = dotenv_values(os.path.join(os.getcwd(), ".env"))
     raw = os.getenv(query_env_key(source_query)) or env_values.get(query_env_key(source_query))
     try:
@@ -413,8 +532,103 @@ def get_channel_id_for_job(job):
     except ValueError:
         channel_id = None
     if channel_id:
+        save_channel_mapping(source_query, channel_id, source_query)
         return channel_id
     return CHANNEL_ID
+
+
+def consolidate_duplicate_channels():
+    """Deactivate duplicate source_query mappings that point at the same channel.
+
+    When two queries (e.g. "full stack developer" and "fullstackjobs") both
+    resolve to the same Discord channel, keep the one whose name matches the
+    channel's actual name, and deactivate the other.
+    """
+    active = get_channel_mappings()
+    by_channel = {}
+    for source_query, channel_id, channel_name, active_flag in active:
+        if not active_flag:
+            continue
+        by_channel.setdefault(channel_id, []).append((source_query, channel_name))
+    consolidated = 0
+    for channel_id, entries in by_channel.items():
+        if len(entries) < 2:
+            continue
+        scored = []
+        for source_query, channel_name in entries:
+            sq_norm = source_query.casefold().replace(".", " ").replace("-", " ").strip()
+            cn_norm = (channel_name or "").casefold().replace(".", " ").replace("-", " ").strip()
+            if sq_norm and cn_norm and (sq_norm in cn_norm or cn_norm in sq_norm):
+                score = 2
+            elif any(w in cn_norm.split() for w in sq_norm.split() if w):
+                score = 1
+            else:
+                score = 0
+            scored.append((score, source_query))
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        keep_query = scored[0][1]
+        for _score, source_query in scored[1:]:
+            if mark_channel_deleted(source_query):
+                logger.info(
+                    "Consolidated duplicate channel %s: keeping '%s', deactivated '%s'",
+                    channel_id, keep_query, source_query,
+                )
+                consolidated += 1
+    return consolidated
+
+
+def sync_search_queries_with_channels():
+    """Keep UPWORK_SEARCH_QUERIES in .env in sync with active channel mappings.
+
+    - Every active channel's query is (re-)added, so a re-created channel
+      starts scraping again even if its query was removed when it was deleted.
+    - Queries whose channel mapping is inactive are dropped, so deleted
+      channels stop being scraped.
+    """
+    mappings = get_channel_mappings()
+    active_queries = {(sq or "").casefold() for sq, _cid, _name, active in mappings if active}
+    inactive_queries = {(sq or "").casefold() for sq, _cid, _name, active in mappings if not active}
+
+    env_path = os.path.join(os.getcwd(), ".env")
+    try:
+        with open(env_path, "r", encoding="utf-8") as file:
+            lines = file.readlines()
+    except FileNotFoundError:
+        return
+
+    queries = []
+    for line in lines:
+        if line.startswith("UPWORK_SEARCH_QUERIES="):
+            queries = [item.strip() for item in line.split("=", 1)[1].split(",") if item.strip()]
+            break
+
+    updated = False
+    # Re-add queries for active channels that are missing from the list.
+    existing = {q.casefold() for q in queries}
+    for query in sorted(active_queries):
+        if query and query not in existing:
+            queries.insert(0, query)
+            updated = True
+            logger.info("Re-added search query for active channel: '%s'", query)
+    # Drop queries for channels that are deleted/inactive.
+    kept = [q for q in queries if q.casefold() not in inactive_queries]
+    if len(kept) != len(queries):
+        dropped = [q for q in queries if q.casefold() in inactive_queries]
+        updated = True
+        logger.info("Dropped search queries with no active channel: %s", dropped)
+        queries = kept
+
+    if updated:
+        replacement = f"UPWORK_SEARCH_QUERIES={','.join(queries)}\n"
+        for index, line in enumerate(lines):
+            if line.startswith("UPWORK_SEARCH_QUERIES="):
+                lines[index] = replacement
+                break
+        else:
+            lines.append(replacement)
+        with open(env_path, "w", encoding="utf-8") as file:
+            file.writelines(lines)
+        load_dotenv(override=True)
 
 
 def discover_query_channels():
@@ -425,28 +639,37 @@ def discover_query_channels():
         for channel in bot.get_all_channels()
         if isinstance(channel, discord.TextChannel)
     }
+    # The guild/channel cache may not be populated yet (right after on_ready).
+    # Never make delete/rename decisions from an empty or incomplete cache.
+    if not bot.guilds or not visible_channel_ids:
+        return
     for source_query, channel_id, channel_name, active in get_channel_mappings():
         if channel_id not in visible_channel_ids:
-            if active and mark_channel_deleted(source_query):
-                logger.error("Discord channel '%s' => is deleted", channel_name)
-                persist_deleted_channel_comment(channel_name, channel_id)
-                # Stop scraping this keyword and wipe its jobs so a future
-                # re-created channel starts fetching from zero.
-                remove_search_query(source_query)
+            if not active:
+                continue
+            # Cache is ready and the bot is connected: this channel really is
+            # gone from the server (or the bot lost access to it).
+            logger.warning(
+                "Channel '%s' (ID %s) is no longer visible to the bot; "
+                "marking it deleted and removing its search query.",
+                channel_name,
+                channel_id,
+            )
+            if mark_channel_deleted(source_query):
+                # Delete ALL jobs for this query (posted and unposted) so that
+                # if the channel is created again, scraping starts fresh and
+                # every job is re-fetched from the beginning.
                 removed = delete_jobs_for_query(source_query)
-                if removed:
-                    logger.info(
-                        "Deleted %d stored job(s) for deleted channel '%s'",
-                        removed,
-                        channel_name,
-                    )
-            purged = delete_unposted_jobs_for_query(source_query)
-            if purged:
+                remove_search_query(source_query)
+                persist_deleted_channel_comment(channel_name, channel_id)
                 logger.info(
-                    "Purged %d queued job(s) for missing channel '%s'",
-                    purged,
+                    "Deleted %d job(s) for removed channel '%s'; query '%s' "
+                    "will be re-fetched from scratch if the channel is re-created",
+                    removed,
                     channel_name,
+                    source_query,
                 )
+            continue
     for channel in bot.get_all_channels():
         if not isinstance(channel, discord.TextChannel):
             continue
@@ -465,19 +688,31 @@ def discover_query_channels():
         )
         existing_channel = get_channel_mapping_by_id(channel.id)
         if existing_channel and existing_channel[1] != channel.name:
+            old_query = existing_channel[0]
+            old_name = existing_channel[1]
             update_channel_name(channel.id, channel.name)
-            persist_renamed_channel(existing_channel[1], channel.name, channel.id)
+            persist_renamed_channel(old_name, channel.name, channel.id)
             logger.info(
                 "Discord channel renamed: '%s' -> '%s'",
-                existing_channel[1],
+                old_name,
                 channel.name,
             )
+            if old_query and old_query.casefold() != channel.name.casefold().replace("-", " ").replace("_", " "):
+                if mark_channel_deleted(old_query):
+                    removed = delete_jobs_for_query(old_query)
+                    remove_search_query(old_query)
+                    if removed:
+                        logger.info(
+                            "Deleted %d job(s) for renamed channel '%s' (was '%s')",
+                            removed, channel.name, old_name,
+                        )
         if (
             not matches_configured_query
             and channel.id not in configured_ids
             and not channel_mapping_exists(channel.id)
         ):
             persist_new_channel(channel)
+        matched_query = None
         for query, expected_name in known_queries.items():
             exact_name = channel_name == expected_name.casefold()
             keyword_sets = QUERY_CHANNEL_KEYWORDS.get(query)
@@ -497,21 +732,48 @@ def discover_query_channels():
             else:
                 keyword_match = query_channel_matches(query, channel_name)
             if exact_name or keyword_match:
-                existing = get_channel_mapping(query)
-                mapping_changed = existing != (channel.id, channel.name)
-                if mapping_changed:
-                    save_channel_mapping(query, channel.id, channel.name)
-                    env_key = QUERY_CHANNEL_ENV_KEYS.get(query, query_env_key(query))
-                    if channel.id not in configured_ids:
-                        persist_channel_id(env_key, channel.id)
-                    logger.info("Channel discovered or updated: %s", channel.name)
+                matched_query = query
+                break
+        if matched_query:
+            existing = get_channel_mapping(matched_query)
+            if existing != (channel.id, channel.name):
+                if existing is None and has_channel_mapping_for_query(matched_query):
+                    # Re-creation: this query had a channel that was deleted.
+                    # Wipe every job recorded under it so the new channel gets
+                    # a completely fresh feed from zero.
+                    wiped = delete_jobs_for_query(matched_query)
+                    if wiped:
+                        logger.info(
+                            "Cleared %d old job(s) for re-created channel '%s'",
+                            wiped,
+                            matched_query,
+                        )
+                save_channel_mapping(matched_query, channel.id, channel.name)
+                # Make sure the scraper is searching this keyword again — the
+                # query is removed when the channel is deleted and must come
+                # back when the channel is re-created.
+                persist_search_query(matched_query)
+                env_key = QUERY_CHANNEL_ENV_KEYS.get(matched_query, query_env_key(matched_query))
+                if channel.id not in configured_ids:
+                    persist_channel_id(env_key, channel.id)
+                logger.info("Channel discovered or updated: %s (query: %s)", channel.name, matched_query)
 
 
 @bot.event
 async def on_ready():
     logger.info("Bot logged in as %s", bot.user)
     init_db()
+    purged = purge_unpostable_jobs()
+    if purged:
+        logger.info("Purged %d unposted job(s) older than 30 days on startup", purged)
     discover_query_channels()
+    sync_search_queries_with_channels()
+    # Only consolidate when the channel cache is actually populated, otherwise
+    # the "duplicates" logic deactivates good mappings based on an empty cache.
+    if bot.guilds and any(bot.get_all_channels()):
+        consolidated = consolidate_duplicate_channels()
+        if consolidated:
+            logger.info("Consolidated %d duplicate channel mapping(s)", consolidated)
     if not post_new_jobs_loop.is_running():
         post_new_jobs_loop.start()
 
@@ -525,6 +787,7 @@ async def post_new_jobs_loop():
         last_memory_check = now
     if now - last_channel_discovery >= CHANNEL_DISCOVERY_INTERVAL_SECONDS:
         discover_query_channels()
+        sync_search_queries_with_channels()
         last_channel_discovery = now
     if now - last_uptime_report >= UPTIME_REPORT_INTERVAL_SECONDS:
         logger.info("System running time: %s", format_uptime(now - bot_started_at))
@@ -535,7 +798,30 @@ async def post_new_jobs_loop():
         logger.exception("Could not read unposted jobs")
         return
 
+    if not jobs:
+        return
+
+    logger.info("Posting loop found %d unposted job(s)", len(jobs))
+
     for job in jobs:
+        if not job.get("full_description") and job.get("ciphertext"):
+            try:
+                details = extract_detail_fields(fetch_job_details(job["ciphertext"]))
+                if details.get("is_private"):
+                    # Transient failures (network hiccup, rate limit) look
+                    # identical to a genuinely private job. Retry once
+                    # before accepting the private/unavailable verdict.
+                    time.sleep(2)
+                    details = extract_detail_fields(fetch_job_details(job["ciphertext"]))
+                if details.get("is_private"):
+                    # The job has a valid ciphertext, so its public page
+                    # exists: never reroute it to the private/unavailable
+                    # channel just because detail enrichment failed.
+                    details["is_private"] = 0
+                update_job_details(job["job_id"], details)
+                job.update({k: v for k, v in details.items() if v is not None})
+            except Exception:
+                logger.exception("Could not backfill details for job %s", job.get("job_id"))
         channel_id = get_channel_id_for_job(job)
         if channel_id is None:
             if job.get("is_private"):
@@ -567,6 +853,21 @@ async def post_new_jobs_loop():
             continue
         try:
             message = await channel.send(format_job_message(job))
+            try:
+                thread_name = f"Job: {(job.get('title') or 'Untitled')[:80]}"
+                thread_content = format_thread_content(job)
+                thread = await message.create_thread(
+                    name=thread_name,
+                    auto_archive_duration=60,
+                )
+                await thread.send(thread_content)
+                logger.info(
+                    "Created thread for job '%s' in channel '%s'",
+                    job.get("title", "Untitled job"),
+                    channel.name,
+                )
+            except Exception:
+                logger.exception("Could not create thread for job %s", job.get("job_id"))
             mark_as_posted(job["job_id"])
             logger.info(
                 "Posted job '%s' to channel '%s'",

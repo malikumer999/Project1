@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Upwork Scraper Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+</head>
+<body>
+    <header class="topbar">
+        <div class="brand">
+            <span class="logo">●</span>
+            <span class="title">Upwork Scraper Dashboard</span>
+        </div>
+        <div class="controls">
+            <button id="btn-toggle" class="ctrl-btn start" data-state="stopped" title="Start or stop the system">▶ Start</button>
+        </div>
+        <div class="status">
+            <span class="dot" id="status-dot"></span>
+            <span id="status-text">Connecting…</span>
+            <span id="child-pid" class="subtle"></span>
+        </div>
+    </header>
+
+    <main class="container">
+        <section class="timer-card">
+            <div class="label">System Uptime</div>
+            <div class="timer" id="uptime">--:--:--</div>
+            <div class="subtle" id="started-at">Started: --</div>
+        </section>
+
+        <section class="stats-grid">
+            <div class="stat-card">
+                <div class="label">Discord Channels</div>
+                <div class="value" id="channel-count">0</div>
+                <div class="subtle">Active mappings</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Total Jobs</div>
+                <div class="value" id="total-jobs">0</div>
+                <div class="subtle">In database</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Posted to Discord</div>
+                <div class="value" id="posted-jobs">0</div>
+                <div class="subtle">Successfully delivered</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Queued</div>
+                <div class="value" id="unposted-jobs">0</div>
+                <div class="subtle">Awaiting Discord post</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Private Jobs</div>
+                <div class="value" id="private-jobs">0</div>
+                <div class="subtle">No public link</div>
+            </div>
+        </section>
+
+        <section class="panel">
+            <h2>Live Discord Channels</h2>
+            <table class="data-table" id="channels-live-table">
+                <thead>
+                    <tr>
+                        <th>Source Query</th>
+                        <th>Channel Name</th>
+                        <th>Channel ID</th>
+                        <th>Status</th>
+                        <th>Updated</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr><td colspan="5" class="empty">Loading…</td></tr>
+                </tbody>
+            </table>
+        </section>
+
+        <section class="panel">
+            <h2>Discord Channels</h2>
+            <table class="data-table" id="channel-table">
+                <thead>
+                    <tr>
+                        <th>Channel / Source Query</th>
+                        <th>Channel ID</th>
+                        <th>Total Jobs</th>
+                        <th>Posted</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr><td colspan="4" class="empty">Loading…</td></tr>
+                </tbody>
+            </table>
+        </section>
+
+        <section class="panel">
+            <h2>Recently Posted Jobs</h2>
+            <table class="data-table" id="recent-table">
+                <thead>
+                    <tr>
+                        <th>Title</th>
+                        <th>Source</th>
+                        <th>Posted At</th>
+                        <th>First Seen</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr><td colspan="4" class="empty">Loading…</td></tr>
+                </tbody>
+            </table>
+        </section>
+    </main>
+
+    <div id="stop-overlay" class="stop-overlay hidden">
+        <div class="stop-card">
+            <h1>System Stopped</h1>
+            <div class="stop-uptime" id="stop-uptime">--</div>
+            <div class="stop-stats">
+                <div><span class="big" id="stop-total">0</span><span>Total Jobs</span></div>
+                <div><span class="big" id="stop-posted">0</span><span>Posted</span></div>
+                <div><span class="big" id="stop-channels">0</span><span>Channels</span></div>
+            </div>
+            <p class="hint">You can close this window. The scraper has been shut down.</p>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+</body>
+</html>
